@@ -263,8 +263,7 @@ def show_adversarial_examples(model, loader, epsilon, device, n=5):
     plt.show()
 
 def plot_comparison(base_clean_acc, base_adv_acc, adv_clean_acc, adv_adv_acc):
-    import matplotlib.pyplot as plt
-
+    
     labels = ['Base model', 'Adv model']
     clean_acc = [base_clean_acc, adv_clean_acc]
     adv_acc = [base_adv_acc, adv_adv_acc]
@@ -281,8 +280,6 @@ def plot_comparison(base_clean_acc, base_adv_acc, adv_clean_acc, adv_adv_acc):
     plt.legend()
     plt.show()
     
-    
-
 # =========================
 # 7. Main - comparaison des deux modeles
 # =========================
