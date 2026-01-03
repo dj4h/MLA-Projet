@@ -1,0 +1,468 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+import matplotlib.pyplot as plt
+import numpy as np
+
+# =========================
+# 0. Configuration
+# =========================
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# Paramètres par défaut
+batch_size = 128
+test_batch_size = 1000
+lr = 1e-3
+epochs_clean = 3
+epochs_adv = 3
+alpha_adv = 0.5  # poids clean vs adversarial dans la loss
+
+# Epsilon différent selon le dataset
+epsilon_fashion = 0.1   # plus petit que MNIST car images plus complexes
+epsilon_cifar = 0.03    # encore plus petit pour CIFAR (RGB normalisé)
+
+# =========================
+# 1. Datasets et loaders
+# =========================
+
+def get_datasets(dataset_name='fashion'):
+    """
+    Retourne les datasets et loaders pour Fashion-MNIST ou CIFAR-10
+    """
+    transform_train = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+    
+    transform_test = transforms.ToTensor()
+    
+    if dataset_name.lower() == 'fashion':
+        # Fashion-MNIST
+        train_dataset = datasets.FashionMNIST(
+            root="./data",
+            train=True,
+            download=True,
+            transform=transform_train,
+        )
+        test_dataset = datasets.FashionMNIST(
+            root="./data",
+            train=False,
+            download=True,
+            transform=transform_test,
+        )
+        classes = [
+            'T-shirt/top', 'Trouser', 'Pullover', 'Dress', 'Coat',
+            'Sandal', 'Shirt', 'Sneaker', 'Bag', 'Ankle boot'
+        ]
+        epsilon = epsilon_fashion
+        in_channels = 1
+        
+    elif dataset_name.lower() == 'cifar':
+        # CIFAR-10
+        transform_train = transforms.Compose([
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+        ])
+        
+        train_dataset = datasets.CIFAR10(
+            root="./data",
+            train=True,
+            download=True,
+            transform=transform_train,
+        )
+        test_dataset = datasets.CIFAR10(
+            root="./data",
+            train=False,
+            download=True,
+            transform=transform_test,
+        )
+        classes = [
+            'airplane', 'automobile', 'bird', 'cat', 'deer',
+            'dog', 'frog', 'horse', 'ship', 'truck'
+        ]
+        epsilon = epsilon_cifar
+        in_channels = 3
+        
+    else:
+        raise ValueError("Dataset must be 'fashion' or 'cifar'")
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=test_batch_size, shuffle=False)
+    
+    print(f"\n=== Dataset: {dataset_name.upper()} ===")
+    print(f"Train size: {len(train_dataset)}, Test size: {len(test_dataset)}")
+    print(f"Classes: {classes}")
+    print(f"Input shape: {train_dataset[0][0].shape}")
+    print(f"Epsilon: {epsilon}")
+    
+    return train_dataset, test_dataset, train_loader, test_loader, classes, epsilon, in_channels
+
+# =========================
+# 2. Modèles adaptés
+# =========================
+
+class SimpleFashionCNN(nn.Module):
+    """Pour Fashion-MNIST (28x28 grayscale)"""
+    def __init__(self):
+        super().__init__()
+        # entree: 1 x 28 x 28
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool2d(2, 2)  # 64 x 14 x 14
+        self.fc1 = nn.Linear(64 * 14 * 14, 128)
+        self.fc2 = nn.Linear(128, 10)
+        
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = self.pool(x)
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+class SimpleCIFARCNN(nn.Module):
+    """Pour CIFAR-10 (32x32 RGB)"""
+    def __init__(self):
+        super().__init__()
+        # entree: 3 x 32 x 32
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool2d(2, 2)  # 64 x 16 x 16
+        self.fc1 = nn.Linear(64 * 16 * 16, 128)
+        self.fc2 = nn.Linear(128, 10)
+        
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = self.pool(x)
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+def create_model(dataset_name, device):
+    """Crée le modèle approprié"""
+    if dataset_name == 'fashion':
+        model = SimpleFashionCNN()
+    else:  # cifar
+        model = SimpleCIFARCNN()
+    
+    model = model.to(device)
+    print(f"\nModel created for {dataset_name}")
+    print(f"Number of parameters: {sum(p.numel() for p in model.parameters()):,}")
+    return model
+
+# =========================
+# 3. FGSM Attack
+# =========================
+
+def fgsm_attack(model, images, labels, epsilon, device):
+    """Génère des exemples adverses avec FGSM"""
+    model.eval()
+    
+    images = images.clone().detach().to(device)
+    images.requires_grad = True
+    labels = labels.to(device)
+    
+    outputs = model(images)
+    loss = F.cross_entropy(outputs, labels)
+    
+    model.zero_grad()
+    loss.backward()
+    
+    grad_sign = images.grad.data.sign()
+    adv_images = images + epsilon * grad_sign
+    adv_images = torch.clamp(adv_images, 0, 1)
+    
+    return adv_images.detach()
+
+# =========================
+# 4. Entraînement et évaluation
+# =========================
+
+def train_one_epoch_clean(model, loader, optimizer, epoch, device):
+    """Entraînement standard"""
+    model.train()
+    total_loss = 0
+    correct = 0
+    total = 0
+    
+    for data, target in loader:
+        data, target = data.to(device), target.to(device)
+        
+        optimizer.zero_grad()
+        output = model(data)
+        loss = F.cross_entropy(output, target)
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item() * data.size(0)
+        pred = output.argmax(dim=1)
+        correct += pred.eq(target).sum().item()
+        total += data.size(0)
+    
+    avg_loss = total_loss / total
+    acc = correct / total
+    print(f"[Train clean] Epoch {epoch} - Loss: {avg_loss:.4f}, Acc: {acc:.4f}")
+
+def train_one_epoch_adversarial(model, loader, optimizer, epoch, device, epsilon, alpha):
+    """Adversarial training"""
+    model.train()
+    total_loss = 0
+    correct = 0
+    total = 0
+    
+    for data, target in loader:
+        data, target = data.to(device), target.to(device)
+        
+        # Génération des exemples adverses
+        adv_data = fgsm_attack(model, data, target, epsilon, device)
+        
+        optimizer.zero_grad()
+        
+        output_clean = model(data)
+        output_adv = model(adv_data)
+        
+        loss_clean = F.cross_entropy(output_clean, target)
+        loss_adv = F.cross_entropy(output_adv, target)
+        
+        loss = alpha * loss_clean + (1 - alpha) * loss_adv
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item() * data.size(0)
+        pred = output_clean.argmax(dim=1)
+        correct += pred.eq(target).sum().item()
+        total += data.size(0)
+    
+    avg_loss = total_loss / total
+    acc = correct / total
+    print(f"[Train adv] Epoch {epoch} - Loss: {avg_loss:.4f}, Clean Acc: {acc:.4f}")
+
+def evaluate_model(model, loader, device, epsilon=None, label="Model"):
+    """Évalue le modèle sur des exemples clean ou adverses"""
+    model.eval()
+    
+    if epsilon is None:
+        # Évaluation clean
+        test_loss = 0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for data, target in loader:
+                data, target = data.to(device), target.to(device)
+                output = model(data)
+                loss = F.cross_entropy(output, target, reduction="sum")
+                test_loss += loss.item()
+                pred = output.argmax(dim=1)
+                correct += pred.eq(target).sum().item()
+                total += data.size(0)
+        
+        avg_loss = test_loss / total
+        acc = correct / total
+        print(f"[{label}] Clean - Loss: {avg_loss:.4f}, Acc: {acc:.4f}")
+        
+    else:
+        # Évaluation adversarial
+        adv_loss = 0
+        correct = 0
+        total = 0
+        
+        for data, target in loader:
+            data, target = data.to(device), target.to(device)
+            adv_data = fgsm_attack(model, data, target, epsilon, device)
+            output = model(adv_data)
+            loss = F.cross_entropy(output, target, reduction="sum")
+            adv_loss += loss.item()
+            pred = output.argmax(dim=1)
+            correct += pred.eq(target).sum().item()
+            total += data.size(0)
+        
+        avg_loss = adv_loss / total
+        acc = correct / total
+        print(f"[{label}] Adv (ε={epsilon}) - Loss: {avg_loss:.4f}, Acc: {acc:.4f}")
+    
+    return avg_loss, acc
+
+# =========================
+# 5. Visualisation
+# =========================
+
+def show_adversarial_examples(model, loader, epsilon, device, classes, n=5, dataset_name='fashion'):
+    """Affiche des exemples adverses"""
+    model.eval()
+    images, labels = next(iter(loader))
+    images, labels = images.to(device), labels.to(device)
+    adv_images = fgsm_attack(model, images, labels, epsilon, device)
+    
+    images = images.cpu().detach()
+    adv_images = adv_images.cpu().detach()
+    
+    # Obtenir les prédictions
+    with torch.no_grad():
+        clean_preds = model(images.to(device)).argmax(dim=1).cpu()
+        adv_preds = model(adv_images.to(device)).argmax(dim=1).cpu()
+    
+    cmap = 'gray' if dataset_name == 'fashion' else None
+    
+    plt.figure(figsize=(15, 4*n//5))
+    for i in range(n):
+        # Original
+        plt.subplot(3, n, i + 1)
+        if dataset_name == 'fashion':
+            plt.imshow(images[i].squeeze(), cmap=cmap)
+        else:
+            plt.imshow(images[i].permute(1, 2, 0))
+        plt.title(f"Orig: {classes[labels[i]]}\nPred: {classes[clean_preds[i]]}")
+        plt.axis('off')
+        
+        # Adversarial
+        plt.subplot(3, n, n + i + 1)
+        if dataset_name == 'fashion':
+            plt.imshow(adv_images[i].squeeze(), cmap=cmap)
+        else:
+            plt.imshow(adv_images[i].permute(1, 2, 0))
+        plt.title(f"Adv Pred: {classes[adv_preds[i]]}")
+        plt.axis('off')
+        
+        # Différence (amplifiée pour visualisation)
+        plt.subplot(3, n, 2*n + i + 1)
+        diff = (adv_images[i] - images[i])
+        if dataset_name == 'fashion':
+            diff_vis = diff.squeeze()
+        else:
+            diff_vis = diff.permute(1, 2, 0)
+            # Normaliser pour visualisation
+            diff_vis = (diff_vis - diff_vis.min()) / (diff_vis.max() - diff_vis.min())
+        
+        plt.imshow(diff_vis, cmap='seismic', vmin=-epsilon, vmax=epsilon)
+        plt.title("Perturbation")
+        plt.axis('off')
+    
+    plt.suptitle(f"Adversarial Examples - {dataset_name.upper()} (ε={epsilon})")
+    plt.tight_layout()
+    plt.show()
+
+def plot_comparison(base_results, adv_results, dataset_name):
+    """Affiche la comparaison des résultats"""
+    labels = ['Base model', 'Adversarial model']
+    clean_acc = [base_results['clean_acc'], adv_results['clean_acc']]
+    adv_acc = [base_results['adv_acc'], adv_results['adv_acc']]
+    
+    x = range(len(labels))
+    
+    plt.figure(figsize=(10, 6))
+    plt.bar(x, clean_acc, width=0.4, label='Clean Accuracy', color='skyblue', alpha=0.8)
+    plt.bar([i + 0.4 for i in x], adv_acc, width=0.4, label='Adversarial Accuracy', color='salmon', alpha=0.8)
+    plt.xticks([i + 0.2 for i in x], labels)
+    plt.ylim(0, 1)
+    plt.ylabel("Accuracy")
+    plt.title(f"Performance Comparison - {dataset_name.upper()}")
+    plt.legend()
+    plt.grid(axis='y', alpha=0.3)
+    
+    # Ajouter les valeurs sur les barres
+    for i, v in enumerate(clean_acc):
+        plt.text(i, v + 0.01, f'{v:.3f}', ha='center')
+    for i, v in enumerate(adv_acc):
+        plt.text(i + 0.4, v + 0.01, f'{v:.3f}', ha='center')
+    
+    plt.show()
+
+# =========================
+# 6. Fonction principale
+# =========================
+
+def run_experiment(dataset_name='fashion'):
+    """Exécute une expérience complète sur un dataset"""
+    print(f"\n{'='*60}")
+    print(f"EXPERIMENT: {dataset_name.upper()}")
+    print(f"{'='*60}")
+    
+    # 1. Charger les données
+    train_dataset, test_dataset, train_loader, test_loader, classes, epsilon, in_channels = get_datasets(dataset_name)
+    
+    # 2. Modèle de base (clean training)
+    print("\n=== Base Model (Clean Training) ===")
+    base_model = create_model(dataset_name, device)
+    optimizer_base = optim.Adam(base_model.parameters(), lr=lr)
+    
+    for epoch in range(1, epochs_clean + 1):
+        train_one_epoch_clean(base_model, train_loader, optimizer_base, epoch, device)
+        evaluate_model(base_model, test_loader, device, label="Base model")
+    
+    # Évaluation
+    base_clean_loss, base_clean_acc = evaluate_model(base_model, test_loader, device, label="Base model")
+    base_adv_loss, base_adv_acc = evaluate_model(base_model, test_loader, device, epsilon=epsilon, label="Base model")
+    
+    # Visualisation
+    show_adversarial_examples(base_model, test_loader, epsilon, device, classes, n=5, dataset_name=dataset_name)
+    
+    # 3. Modèle avec adversarial training
+    print("\n=== Adversarial Model (Adversarial Training) ===")
+    adv_model = create_model(dataset_name, device)
+    optimizer_adv = optim.Adam(adv_model.parameters(), lr=lr)
+    
+    for epoch in range(1, epochs_adv + 1):
+        train_one_epoch_adversarial(adv_model, train_loader, optimizer_adv, epoch, device, epsilon, alpha_adv)
+        evaluate_model(adv_model, test_loader, device, label="Adv model")
+    
+    # Évaluation
+    adv_clean_loss, adv_clean_acc = evaluate_model(adv_model, test_loader, device, label="Adv model")
+    adv_adv_loss, adv_adv_acc = evaluate_model(adv_model, test_loader, device, epsilon=epsilon, label="Adv model")
+    
+    # 4. Résumé
+    print(f"\n{'='*60}")
+    print(f"SUMMARY - {dataset_name.upper()}")
+    print(f"{'='*60}")
+    print(f"Base model  - Clean: {base_clean_acc:.4f}, Adv: {base_adv_acc:.4f}")
+    print(f"Adv model   - Clean: {adv_clean_acc:.4f}, Adv: {adv_adv_acc:.4f}")
+    print(f"Improvement - Clean: {adv_clean_acc - base_clean_acc:+.4f}, Adv: {adv_adv_acc - base_adv_acc:+.4f}")
+    
+    # 5. Graphique de comparaison
+    base_results = {'clean_acc': base_clean_acc, 'adv_acc': base_adv_acc}
+    adv_results = {'clean_acc': adv_clean_acc, 'adv_acc': adv_adv_acc}
+    plot_comparison(base_results, adv_results, dataset_name)
+    
+    return {
+        'dataset': dataset_name,
+        'epsilon': epsilon,
+        'base_clean_acc': base_clean_acc,
+        'base_adv_acc': base_adv_acc,
+        'adv_clean_acc': adv_clean_acc,
+        'adv_adv_acc': adv_adv_acc,
+    }
+
+# =========================
+# 7. Exécution principale
+# =========================
+
+def main():
+    """Exécute les expériences pour Fashion-MNIST et CIFAR-10"""
+    results = {}
+    
+    # Expérience sur Fashion-MNIST
+    results['fashion'] = run_experiment('fashion')
+    
+    # Expérience sur CIFAR-10
+    results['cifar'] = run_experiment('cifar')
+    
+    # Résumé final
+    print(f"\n{'='*60}")
+    print("FINAL COMPARISON")
+    print(f"{'='*60}")
+    
+    for dataset_name, res in results.items():
+        print(f"\n{dataset_name.upper()}:")
+        print(f"  Epsilon: {res['epsilon']}")
+        print(f"  Base model: Clean={res['base_clean_acc']:.4f}, Adv={res['base_adv_acc']:.4f}")
+        print(f"  Adv model:  Clean={res['adv_clean_acc']:.4f}, Adv={res['adv_adv_acc']:.4f}")
+
+if __name__ == "__main__":
+    main()
