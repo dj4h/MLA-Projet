@@ -6,7 +6,6 @@ import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
-from tqdm import tqdm
 import time
 
 # =========================
@@ -15,7 +14,7 @@ import time
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
-# Tu peux ajuster ces valeurs pour gagner du temps sur CPU
+# valeurs à ajuster pour CPU
 batch_size = 128
 test_batch_size = 1000
 lr = 1e-3

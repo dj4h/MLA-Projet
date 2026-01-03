@@ -1,5 +1,6 @@
 # Reprise du code des 2A
 # Ajout de visualisation
+# Ajout de PGD
 
 import torch
 import torch.nn as nn
@@ -25,6 +26,9 @@ epochs_adv = 3        # nb d epoques pour le modele adversarial
 
 epsilon = 0.25        # intensite de la perturbation FGSM
 alpha_adv = 0.5       # poids clean vs adversarial dans la loss
+
+pgd_alpha = epsilon/20      # pas de GD pixel par pixel
+pgd_steps = 20        # nombre d'itérations PGD
 
 # =========================
 # 1. Chargement de MNIST
@@ -158,6 +162,43 @@ def fgsm_attack(model, images, labels, epsilon, device):
     return adv_images.detach()
 
 # =========================
+# 4bis. PGD - Descente de gradient pixel par pixel
+# =========================
+
+def pgd_attack(model, images, labels, epsilon, alpha, num_iter, device):
+    """
+    PGD (Projected Gradient Descent)
+    Descente de gradient pixel par pixel
+    """
+    model.eval()
+
+    images = images.clone().detach().to(device)
+    labels = labels.to(device)
+
+    # Initialisation aléatoire dans la boule epsilon
+    adv_images = images + torch.empty_like(images).uniform_(-epsilon, epsilon)
+    adv_images = torch.clamp(adv_images, 0, 1)
+
+    for _ in range(num_iter):
+        adv_images.requires_grad = True
+
+        outputs = model(adv_images)
+        loss = F.cross_entropy(outputs, labels)
+
+        model.zero_grad()
+        loss.backward()
+
+        # Mise à jour pixel par pixel
+        grad_sign = adv_images.grad.data.sign()
+        adv_images = adv_images + alpha * grad_sign
+
+        # Projection dans la boule epsilon
+        eta = torch.clamp(adv_images - images, min=-epsilon, max=epsilon)
+        adv_images = torch.clamp(images + eta, 0, 1).detach()
+
+    return adv_images
+
+# =========================
 # 5. Test sur adversarial examples
 # =========================
 
@@ -183,6 +224,30 @@ def test_model_adversarial(model, loader, epsilon, device, label="Model"):
     avg_loss = adv_loss / total
     acc = correct / total
     print(f"[{label}] Test adversarial eps={epsilon} - Loss: {avg_loss:.4f}, Acc: {acc:.4f}")
+    return avg_loss, acc
+
+def test_model_adversarial_pgd(model, loader, epsilon, alpha, num_iter, device, label="Model"):
+    model.eval()
+    adv_loss = 0
+    correct = 0
+    total = 0
+
+    for data, target in loader:
+        data, target = data.to(device), target.to(device)
+
+        adv_data = pgd_attack(model, data, target, epsilon, alpha, num_iter, device)
+
+        outputs = model(adv_data)
+        loss = F.cross_entropy(outputs, target, reduction="sum")
+        adv_loss += loss.item()
+
+        pred = outputs.argmax(dim=1)
+        correct += pred.eq(target).sum().item()
+        total += data.size(0)
+
+    avg_loss = adv_loss / total
+    acc = correct / total
+    print(f"[{label}] PGD eps={epsilon} - Loss: {avg_loss:.4f}, Acc: {acc:.4f}")
     return avg_loss, acc
 
 # =========================
@@ -262,21 +327,62 @@ def show_adversarial_examples(model, loader, epsilon, device, n=5):
     plt.tight_layout()
     plt.show()
 
-def plot_comparison(base_clean_acc, base_adv_acc, adv_clean_acc, adv_adv_acc):
-    
+def show_pgd_examples(model, loader, epsilon, alpha, steps, device, n=5):
+    model.eval()
+    images, labels = next(iter(loader))
+    images, labels = images[:n].to(device), labels[:n].to(device)
+
+    adv_images = pgd_attack(model, images, labels, epsilon, alpha, steps, device)
+
+    images = images.cpu()
+    adv_images = adv_images.cpu()
+
+    plt.figure(figsize=(12, 6))
+    for i in range(n):
+        # original
+        plt.subplot(3, n, i + 1)
+        plt.imshow(images[i].squeeze(), cmap='gray')
+        plt.title(f"Orig: {labels[i].item()}")
+        plt.axis('off')
+
+        # PGD
+        plt.subplot(3, n, n + i + 1)
+        plt.imshow(adv_images[i].squeeze(), cmap='gray')
+        plt.title("PGD")
+        plt.axis('off')
+
+        # différence
+        plt.subplot(3, n, 2*n + i + 1)
+        diff = (adv_images[i] - images[i]).squeeze()
+        plt.imshow(diff, cmap='seismic', vmin=-epsilon, vmax=epsilon)
+        plt.title("Diff")
+        plt.axis('off')
+
+    plt.suptitle(f"PGD attack (ε={epsilon}, steps={steps})")
+    plt.tight_layout()
+    plt.show()
+
+def plot_comparison(
+    base_clean, base_fgsm, base_pgd,
+    adv_clean, adv_fgsm, adv_pgd
+):
     labels = ['Base model', 'Adv model']
-    clean_acc = [base_clean_acc, adv_clean_acc]
-    adv_acc = [base_adv_acc, adv_adv_acc]
-
+    clean = [base_clean, adv_clean]
+    fgsm  = [base_fgsm, adv_fgsm]
+    pgd   = [base_pgd, adv_pgd]
+    
     x = range(len(labels))
+    width = 0.25
 
-    plt.figure(figsize=(8,5))
-    plt.bar(x, clean_acc, width=0.4, label='Clean Accuracy', color='skyblue')
-    plt.bar([i + 0.4 for i in x], adv_acc, width=0.4, label='Adversarial Accuracy', color='salmon')
-    plt.xticks([i + 0.2 for i in x], labels)
+    plt.figure(figsize=(9,5))
+    plt.bar(x, clean, width, label='Clean')
+    plt.bar([i + width for i in x], fgsm, width, label='FGSM')
+    plt.bar([i + 2*width for i in x], pgd, width, label='PGD')
+
+    plt.xticks([i + width for i in x], labels)
     plt.ylim(0,1)
     plt.ylabel("Accuracy")
-    plt.title("Comparaison de performance des modèles")
+    plt.title("Robustesse face aux attaques adversariales")
     plt.legend()
     plt.show()
     
@@ -285,7 +391,7 @@ def plot_comparison(base_clean_acc, base_adv_acc, adv_clean_acc, adv_adv_acc):
 # =========================
 
 def main():
-    # ----- Modele de base, entraine en clean -----
+    # MODELE DE BASE (clean)
     print("\n=== Entrainement du modele de base (clean) ===")
     base_model = SimpleCNN().to(device)
     optimizer_base = optim.Adam(base_model.parameters(), lr=lr)
@@ -294,33 +400,77 @@ def main():
         train_one_epoch_clean(base_model, train_loader, optimizer_base, epoch, device)
         test_model_clean(base_model, test_loader, device, label="Base model")
 
-    print("\nEvaluation du modele de base sur adversarial examples:")
-    base_clean_loss, base_clean_acc = test_model_clean(base_model, test_loader, device, label="Base model")
-    base_adv_loss, base_adv_acc = test_model_adversarial(base_model, test_loader, epsilon, device, label="Base model")
+    print("\n=== Evaluation du modele de base ===")
 
-    print("\nAffichage de quelques adversarial examples :")
+    # ---- Clean ----
+    base_clean_loss, base_clean_acc = test_model_clean(
+        base_model, test_loader, device, label="Base model"
+    )
+
+    # ---- FGSM ----
+    base_fgsm_loss, base_fgsm_acc = test_model_adversarial(
+        base_model, test_loader, epsilon, device, label="Base model (FGSM)"
+    )
+
+    # ---- PGD ----
+    base_pgd_loss, base_pgd_acc = test_model_adversarial_pgd(
+        base_model, test_loader, epsilon, pgd_alpha, pgd_steps, device, label="Base model (PGD)"
+    )
+
+    print("\nVisualisation FGSM (modele de base)")
     show_adversarial_examples(base_model, test_loader, epsilon, device, n=5)
 
-    # ----- Modele avec adversarial training -----
-    print("\n=== Entrainement du modele adversarial (adversarial training) ===")
+    print("\nVisualisation PGD (modele de base)")
+    show_pgd_examples(base_model, test_loader, epsilon, pgd_alpha, pgd_steps, device)
+
+    # MODELE ADVERSARIAL
+    print("\n=== Entrainement du modele adversarial ===")
     adv_model = SimpleCNN().to(device)
     optimizer_adv = optim.Adam(adv_model.parameters(), lr=lr)
 
     for epoch in range(1, epochs_adv + 1):
-        train_one_epoch_adversarial(adv_model, train_loader, optimizer_adv, epoch, device, epsilon, alpha_adv)
+        train_one_epoch_adversarial(
+            adv_model, train_loader, optimizer_adv,
+            epoch, device, epsilon, alpha_adv
+        )
         test_model_clean(adv_model, test_loader, device, label="Adv model")
 
-    print("\nEvaluation du modele adversarial sur adversarial examples:")
-    adv_clean_loss, adv_clean_acc = test_model_clean(adv_model, test_loader, device, label="Adv model")
-    adv_adv_loss, adv_adv_acc = test_model_adversarial(adv_model, test_loader, epsilon, device, label="Adv model")
+    print("\n=== Evaluation du modele adversarial ===")
 
-    # ----- Resume comparatif -----
+    # ---- Clean ----
+    adv_clean_loss, adv_clean_acc = test_model_clean(
+        adv_model, test_loader, device, label="Adv model"
+    )
+
+    # ---- FGSM ----
+    adv_fgsm_loss, adv_fgsm_acc = test_model_adversarial(
+        adv_model, test_loader, epsilon, device, label="Adv model (FGSM)"
+    )
+
+    # ---- PGD ----
+    adv_pgd_loss, adv_pgd_acc = test_model_adversarial_pgd(
+        adv_model, test_loader, epsilon, pgd_alpha, pgd_steps, device, label="Adv model (PGD)"
+    )
+
+    print("\nVisualisation FGSM (modele adversarial)")
+    show_adversarial_examples(adv_model, test_loader, epsilon, device, n=5)
+
+    print("\nVisualisation PGD (modele adversarial)")
+    show_pgd_examples(adv_model, test_loader, epsilon, pgd_alpha, pgd_steps, device)
+
+    # Résumé final
     print("\n=== Resume comparatif ===")
-    print(f"Modele de base - Clean Acc: {base_clean_acc:.4f}, Adv Acc: {base_adv_acc:.4f}")
-    print(f"Modele adv    - Clean Acc: {adv_clean_acc:.4f}, Adv Acc: {adv_adv_acc:.4f}")
+    print(f"Base model - Clean Acc : {base_clean_acc:.4f}")
+    print(f"Base model - FGSM Acc  : {base_fgsm_acc:.4f}")
+    print(f"Base model - PGD Acc   : {base_pgd_acc:.4f}")
 
-    # Visualisation graphique
-    plot_comparison(base_clean_acc, base_adv_acc, adv_clean_acc, adv_adv_acc)
+    print(f"Adv model  - Clean Acc : {adv_clean_acc:.4f}")
+    print(f"Adv model  - FGSM Acc  : {adv_fgsm_acc:.4f}")
+    print(f"Adv model  - PGD Acc   : {adv_pgd_acc:.4f}")
 
+    plot_comparison(
+        base_clean_acc, base_fgsm_acc, base_pgd_acc,
+        adv_clean_acc,  adv_fgsm_acc,  adv_pgd_acc
+)
 if __name__ == "__main__":
     main()
