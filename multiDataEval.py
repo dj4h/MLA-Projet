@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
+from sklearn.metrics import f1_score # étude performance pure
 import matplotlib.pyplot as plt
 import time
 
@@ -55,7 +56,12 @@ datasets_info = {
 class SimpleCNN(nn.Module):
     def __init__(self, in_channels=1, num_classes=10):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1)
+        self.conv1 = nn.Sequential(         # dropout+batchnorm, amélioration itérative
+            nn.Conv2d(in_channels, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.Dropout(0.2)
+        )
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
         self.pool = nn.MaxPool2d(2, 2)
         # calcul de la taille du feature map après pooling (28->14, 32->16)
@@ -97,21 +103,36 @@ def train_one_epoch_clean(model, loader, optimizer, device):
         running_total += data.size(0)
     return running_loss / running_total, running_correct / running_total
 
-def test_model_clean(model, loader, device):
+# accuracy → performance globale et F1-score → plus robuste aux classes difficiles
+def test_model_clean(model, loader, device, return_f1=False):
     model.eval()
-    total_loss = 0.0
     correct = 0
     total = 0
+    all_preds = []
+    all_targets = []
+
     with torch.no_grad():
         for data, target in loader:
             data, target = data.to(device), target.to(device)
             output = model(data)
-            loss = F.cross_entropy(output, target, reduction="sum")
-            total_loss += loss.item()
             pred = output.argmax(dim=1)
+
             correct += pred.eq(target).sum().item()
             total += data.size(0)
-    return total_loss / total, correct / total
+
+            if return_f1:
+                all_preds.append(pred.cpu())
+                all_targets.append(target.cpu())
+
+    acc = correct / total
+
+    if return_f1:
+        y_pred = torch.cat(all_preds).numpy()
+        y_true = torch.cat(all_targets).numpy()
+        f1 = f1_score(y_true, y_pred, average="macro")
+        return acc, f1
+
+    return acc
 
 # =========================
 # FGSM (corrigé)
@@ -140,6 +161,7 @@ def fgsm_attack(model, images, labels, epsilon, device):
     adv_images = torch.clamp(adv_images, 0.0, 1.0)
     return adv_images.detach()
 
+# si le modèle résiste à pgd (attk forte) => robuste
 def pgd_attack(model, images, labels, epsilon, alpha, num_iter, device):
     """
     PGD attack (l_inf)
@@ -216,6 +238,24 @@ def test_model_adversarial_pgd(model, loader, epsilon, alpha, num_iter, device):
 
     return correct / total
 
+# ajout test bruit gaussien non adversarial => fiabilité
+def test_model_noise(model, loader, sigma, device):
+    model.eval()
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for data, target in loader:
+            data, target = data.to(device), target.to(device)
+            noisy_data = data + torch.randn_like(data) * sigma
+            noisy_data = torch.clamp(noisy_data, 0, 1)
+
+            output = model(noisy_data)
+            pred = output.argmax(dim=1)
+            correct += pred.eq(target).sum().item()
+            total += data.size(0)
+
+    return correct / total
 
 def train_one_epoch_adversarial(model, loader, optimizer, epsilon, alpha, device, print_every=100):
     model.train()
@@ -403,7 +443,7 @@ def main():
             t1 = time.time()
             print(f"  Epoch {epoch}/{epochs_clean} - loss: {loss:.4f}, acc: {acc:.4f} (took {t1-t0:.1f}s)")
 
-        clean_loss, clean_acc = test_model_clean(model, test_loader, device)
+        clean_acc, clean_f1 = test_model_clean(model, test_loader, device, return_f1=True)
         # test adv (génération d'adv examples; ne pas entourer de no_grad)
         adv_acc = test_model_adversarial(model, test_loader, epsilon, device)
         print(f" Results (clean model) -> Clean Acc: {clean_acc:.4f}, Adv Acc: {adv_acc:.4f}")
@@ -424,8 +464,12 @@ def main():
             t1 = time.time()
             print(f"  Epoch {epoch}/{epochs_adv} - loss: {loss_a:.4f}, clean-acc: {acc_a:.4f} (took {t1-t0:.1f}s)")
 
-        adv_clean_loss, adv_clean_acc = test_model_clean(model_adv, test_loader, device)
-        adv_adv_acc = test_model_adversarial(model_adv, test_loader, epsilon, device)
+        adv_clean_acc, adv_clean_f1 = test_model_clean(
+            model_adv, test_loader, device, return_f1=True
+        )
+        adv_adv_acc = test_model_adversarial(
+            model_adv, test_loader, epsilon, device
+        )
         print(f" Results (adv model) -> Clean Acc: {adv_clean_acc:.4f}, Adv Acc: {adv_adv_acc:.4f}")
 
         pgd_acc = test_model_adversarial_pgd(
@@ -436,6 +480,17 @@ def main():
             num_iter=10,
             device=device
         )
+
+        pgd_adv_acc = test_model_adversarial_pgd(
+            model_adv,
+            test_loader,
+            epsilon=epsilon,
+            alpha=epsilon / 10,
+            num_iter=10,
+            device=device
+        )
+        
+        noise_acc = test_model_noise(model, test_loader, sigma=0.1, device=device)
 
         show_pgd_examples(
             model,
@@ -454,12 +509,22 @@ def main():
             f"PGD Acc: {pgd_acc:.4f}"
         )
 
+        print(
+            f" Results (adv model) -> "
+            f"Clean Acc: {adv_clean_acc:.4f}, "
+            f"FGSM Acc: {adv_adv_acc:.4f}, "
+            f"PGD Acc: {pgd_adv_acc:.4f}"
+        )
+
         overall_results[name] = {
             'clean': clean_acc,
-            'adv': adv_acc,     # fgsm
-            'pgd': pgd_acc,     # pgd
+            'f1': clean_f1,
+            'fgsm': adv_acc,
+            'pgd': pgd_acc,
+            'noise': noise_acc,
             'adv_clean': adv_clean_acc,
-            'adv_adv': adv_adv_acc
+            'adv_fgsm': adv_adv_acc,
+            'adv_pgd': pgd_adv_acc
         }
 
     # Comparatif global
