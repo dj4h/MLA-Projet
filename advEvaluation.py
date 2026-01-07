@@ -31,19 +31,21 @@ pgd_alpha = epsilon/20      # pas de GD pixel par pixel
 pgd_steps = 20        # nombre d'itérations PGD
 
 # =========================
-# 1. Chargement de MNIST
+# 1. Chargement de MNIST (ou FashionMNIST)
 # =========================
 
 transform = transforms.ToTensor()
 
 train_dataset = datasets.MNIST(
+# train_dataset = datasets.FashionMNIST(
     root="./data",
     train=True,
     download=True,
     transform=transform,
 )
-
+ 
 test_dataset = datasets.MNIST(
+# test_dataset = datasets.FashionMNIST(
     root="./data",
     train=False,
     download=True,

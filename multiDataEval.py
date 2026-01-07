@@ -140,6 +140,40 @@ def fgsm_attack(model, images, labels, epsilon, device):
     adv_images = torch.clamp(adv_images, 0.0, 1.0)
     return adv_images.detach()
 
+def pgd_attack(model, images, labels, epsilon, alpha, num_iter, device):
+    """
+    PGD attack (l_inf)
+    images : tensor (B,C,H,W)
+    """
+    model.eval()
+
+    images = images.to(device)
+    labels = labels.to(device)
+
+    # point de départ = image originale + petit bruit
+    adv_images = images.clone().detach()
+    adv_images = adv_images + 0.001 * torch.randn_like(adv_images)
+    adv_images = torch.clamp(adv_images, 0, 1)
+
+    for _ in range(num_iter):
+        adv_images.requires_grad = True
+
+        outputs = model(adv_images)
+        loss = F.cross_entropy(outputs, labels)
+        model.zero_grad()
+        loss.backward()
+
+        # étape de gradient
+        grad_sign = adv_images.grad.sign()
+        adv_images = adv_images + alpha * grad_sign
+
+        # projection dans la boule epsilon
+        eta = torch.clamp(adv_images - images, min=-epsilon, max=epsilon)
+        adv_images = torch.clamp(images + eta, 0, 1).detach()
+
+    return adv_images
+
+
 def test_model_adversarial(model, loader, epsilon, device):
     model.eval()
     correct = 0
@@ -155,6 +189,33 @@ def test_model_adversarial(model, loader, epsilon, device):
             correct += pred.eq(target).sum().item()
             total += data.size(0)
     return correct / total
+
+def test_model_adversarial_pgd(model, loader, epsilon, alpha, num_iter, device):
+    model.eval()
+    correct = 0
+    total = 0
+
+    for data, target in loader:
+        data, target = data.to(device), target.to(device)
+
+        adv_data = pgd_attack(
+            model,
+            data,
+            target,
+            epsilon=epsilon,
+            alpha=alpha,
+            num_iter=num_iter,
+            device=device
+        )
+
+        with torch.no_grad():
+            output = model(adv_data)
+            pred = output.argmax(dim=1)
+            correct += pred.eq(target).sum().item()
+            total += data.size(0)
+
+    return correct / total
+
 
 def train_one_epoch_adversarial(model, loader, optimizer, epsilon, alpha, device, print_every=100):
     model.train()
@@ -230,6 +291,69 @@ def show_adversarial_examples(model, loader, epsilon, device, n=5):
     plt.tight_layout()
     plt.show()  # <-- maintenant bloquant
 
+def show_pgd_examples(model, loader, epsilon, alpha, num_iter, device, n=5):
+    model.eval()
+    images, labels = next(iter(loader))
+    images, labels = images[:n].to(device), labels[:n].to(device)
+
+    adv_images = pgd_attack(
+        model,
+        images,
+        labels,
+        epsilon,
+        alpha,
+        num_iter,
+        device
+    )
+
+    images = images.cpu()
+    adv_images = adv_images.cpu()
+
+    fig = plt.figure(figsize=(3*n, 6))
+
+    for i in range(n):
+        # ---------- ORIGINAL ----------
+        ax1 = fig.add_subplot(3, n, i+1)
+        img = images[i]
+
+        if img.shape[0] == 1:  # MNIST-like
+            ax1.imshow(img.squeeze(), cmap="gray")
+        else:  # CIFAR-like
+            ax1.imshow(img.permute(1, 2, 0))
+
+        ax1.set_title("Orig")
+        ax1.axis("off")
+
+        # ---------- PGD ----------
+        ax2 = fig.add_subplot(3, n, n+i+1)
+        adv = adv_images[i]
+
+        if adv.shape[0] == 1:
+            ax2.imshow(adv.squeeze(), cmap="gray")
+        else:
+            ax2.imshow(adv.permute(1, 2, 0))
+
+        ax2.set_title("PGD")
+        ax2.axis("off")
+
+        # ---------- DIFF ----------
+        ax3 = fig.add_subplot(3, n, 2*n+i+1)
+        diff = adv_images[i] - images[i]
+
+        if diff.shape[0] == 1:
+            ax3.imshow(diff.squeeze(), cmap="seismic",
+                       vmin=-epsilon, vmax=epsilon)
+        else:
+            # afficher une seule composante pour lisibilité
+            ax3.imshow(diff[0], cmap="seismic",
+                       vmin=-epsilon, vmax=epsilon)
+
+        ax3.set_title("Diff")
+        ax3.axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
 # =========================
 # Trace et comparatif
 # =========================
@@ -304,9 +428,36 @@ def main():
         adv_adv_acc = test_model_adversarial(model_adv, test_loader, epsilon, device)
         print(f" Results (adv model) -> Clean Acc: {adv_clean_acc:.4f}, Adv Acc: {adv_adv_acc:.4f}")
 
+        pgd_acc = test_model_adversarial_pgd(
+            model,
+            test_loader,
+            epsilon=epsilon,
+            alpha=epsilon / 10,
+            num_iter=10,
+            device=device
+        )
+
+        show_pgd_examples(
+            model,
+            test_loader,
+            epsilon,
+            alpha=epsilon / 10,
+            num_iter=10,
+            device=device,
+            n=n_visual
+        )
+
+        print(
+            f" Results (clean model) -> "
+            f"Clean Acc: {clean_acc:.4f}, "
+            f"FGSM Acc: {adv_acc:.4f}, "
+            f"PGD Acc: {pgd_acc:.4f}"
+        )
+
         overall_results[name] = {
             'clean': clean_acc,
-            'adv': adv_acc,
+            'adv': adv_acc,     # fgsm
+            'pgd': pgd_acc,     # pgd
             'adv_clean': adv_clean_acc,
             'adv_adv': adv_adv_acc
         }
