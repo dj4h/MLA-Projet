@@ -399,17 +399,23 @@ def show_pgd_examples(model, loader, epsilon, alpha, num_iter, device, n=5):
 # =========================
 def plot_comparison(results):
     labels = list(results.keys())
+
     clean_acc = [results[l]['clean'] for l in labels]
-    adv_acc = [results[l]['adv'] for l in labels]
+    fgsm_acc = [results[l]['fgsm'] for l in labels]
+    pgd_acc  = [results[l]['pgd']  for l in labels]
+
     x = range(len(labels))
-    
-    plt.figure(figsize=(8,5))
-    plt.bar(x, clean_acc, width=0.4, label='Clean Accuracy')
-    plt.bar([i+0.4 for i in x], adv_acc, width=0.4, label='Adversarial Accuracy')
-    plt.xticks([i+0.2 for i in x], labels)
-    plt.ylim(0,1)
+    width = 0.25
+
+    plt.figure(figsize=(9,5))
+    plt.bar(x, clean_acc, width=width, label='Clean')
+    plt.bar([i + width for i in x], fgsm_acc, width=width, label='FGSM')
+    plt.bar([i + 2*width for i in x], pgd_acc, width=width, label='PGD')
+
+    plt.xticks([i + width for i in x], labels)
+    plt.ylim(0, 1)
     plt.ylabel("Accuracy")
-    plt.title("Comparaison multi-dataset")
+    plt.title("Robustesse multi-dataset")
     plt.legend()
     plt.show()
 

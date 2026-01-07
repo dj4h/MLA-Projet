@@ -27,8 +27,8 @@ epochs_adv = 3        # nb d epoques pour le modele adversarial
 epsilon = 0.25        # intensite de la perturbation FGSM
 alpha_adv = 0.5       # poids clean vs adversarial dans la loss
 
-pgd_alpha = epsilon/20      # pas de GD pixel par pixel
-pgd_steps = 20        # nombre d'itérations PGD
+pgd_alpha = epsilon/20      # pas de GD pixel par pixel, vitesse pgd
+pgd_steps = 20        # nombre d'itérations PGD, attaque + ou - forte
 
 # =========================
 # 1. Chargement de MNIST (ou FashionMNIST)
