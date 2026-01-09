@@ -9,9 +9,7 @@ from sklearn.metrics import f1_score # étude performance pure
 import matplotlib.pyplot as plt
 import time
 
-# =========================
 # Configuration utilisateur
-# =========================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
@@ -20,7 +18,6 @@ batch_size = 128
 test_batch_size = 1000
 lr = 1e-3
 
-# Par défaut mis bas pour exécution raisonnable sur CPU
 epochs_clean = 1
 epochs_adv = 1
 
@@ -28,7 +25,6 @@ epsilon = 0.25
 alpha_adv = 0.5
 n_visual = 5  # nb d'exemples à visualiser par dataset
 
-# Pour accélérer les tests sur CPU, tu peux commenter CIFAR ci-dessous
 datasets_info = {
     "MNIST": {
         "dataset": datasets.MNIST,
@@ -50,18 +46,17 @@ datasets_info = {
     }
 }
 
-# =========================
 # Modèle CNN adaptable
-# =========================
 class SimpleCNN(nn.Module):
     def __init__(self, in_channels=1, num_classes=10):
         super().__init__()
-        self.conv1 = nn.Sequential(         # dropout+batchnorm, amélioration itérative
-            nn.Conv2d(in_channels, 32, 3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.Dropout(0.2)
-        )
+        #self.conv1 = nn.Sequential(         # dropout+batchnorm, amélioration itérative
+        #    nn.Conv2d(in_channels, 32, 3, padding=1),
+        #    nn.BatchNorm2d(32),
+        #    nn.ReLU(),
+        #    nn.Dropout(0.2)
+        #)
+        self.conv1 = nn.Conv2d(in_channels, 32, 3, padding=1)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
         self.pool = nn.MaxPool2d(2, 2)
         # calcul de la taille du feature map après pooling (28->14, 32->16)
@@ -81,14 +76,13 @@ class SimpleCNN(nn.Module):
         x = self.fc2(x)
         return x
 
-# =========================
-# Fonctions d'entraînement / test
-# =========================
+# Fonctions de test
 def train_one_epoch_clean(model, loader, optimizer, device):
     model.train()
     running_loss = 0.0
     running_correct = 0
     running_total = 0
+    
     for data, target in loader:
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
@@ -103,7 +97,7 @@ def train_one_epoch_clean(model, loader, optimizer, device):
         running_total += data.size(0)
     return running_loss / running_total, running_correct / running_total
 
-# accuracy → performance globale et F1-score → plus robuste aux classes difficiles
+# accuracy → performance globale
 def test_model_clean(model, loader, device, return_f1=False):
     model.eval()
     correct = 0
@@ -134,9 +128,7 @@ def test_model_clean(model, loader, device, return_f1=False):
 
     return acc
 
-# =========================
-# FGSM (corrigé)
-# =========================
+# FGSM
 def fgsm_attack(model, images, labels, epsilon, device):
     """
     images : tensor (B,C,H,W)
@@ -194,7 +186,6 @@ def pgd_attack(model, images, labels, epsilon, alpha, num_iter, device):
         adv_images = torch.clamp(images + eta, 0, 1).detach()
 
     return adv_images
-
 
 def test_model_adversarial(model, loader, epsilon, device):
     model.eval()
@@ -285,9 +276,56 @@ def train_one_epoch_adversarial(model, loader, optimizer, epsilon, alpha, device
             print(f"  [adv train] batch {batch_idx+1}/{len(loader)}")
     return running_loss / running_total, running_correct / running_total
 
-# ==============
+def confidence_on_errors(model, loader, adv=False):
+    model.eval()
+    confidences = []
+
+    for data, target in loader:
+        data, target = data.to(device), target.to(device)
+        if adv:
+            data = fgsm_attack(model, data, target, epsilon, device)
+
+        with torch.no_grad():
+            logits = model(data)
+            probs = F.softmax(logits, dim=1)
+            preds = probs.argmax(dim=1)
+
+            mask = preds != target
+            conf = probs.max(dim=1)[0]
+            confidences.extend(conf[mask].cpu().numpy())
+
+    return confidences
+
+
+def local_linearity(model, loader, epsilon=0.01, n_samples=200):
+    """Mesure la linéarité locale des logits pour un modèle et un DataLoader."""
+    model.eval()
+    lin_measures = []
+
+    count = 0
+    for data, _ in loader:
+        if count >= n_samples:
+            break
+        data = data.to(device)
+        batch_size = data.size(0)
+        count += batch_size
+        data.requires_grad_(True)
+        
+        # logits pour les données propres
+        logits_orig = model(data)
+        
+        # perturbation aléatoire
+        perturbed = data + epsilon * torch.randn_like(data)
+        logits_perturbed = model(perturbed)
+        
+        # delta logits / epsilon
+        lin_measure = ((logits_perturbed - logits_orig).norm(dim=1) / epsilon).mean().item()
+        lin_measures.append(lin_measure)
+    
+    return sum(lin_measures)/len(lin_measures)
+
+
 # Visualisation 
-# ==============
 def show_adversarial_examples(model, loader, epsilon, device, n=5):
     model.eval()
     images, labels = next(iter(loader))
@@ -329,7 +367,7 @@ def show_adversarial_examples(model, loader, epsilon, device, n=5):
         ax3.axis("off")
 
     plt.tight_layout()
-    plt.show()  # <-- maintenant bloquant
+    plt.show()  
 
 def show_pgd_examples(model, loader, epsilon, alpha, num_iter, device, n=5):
     model.eval()
@@ -352,7 +390,7 @@ def show_pgd_examples(model, loader, epsilon, alpha, num_iter, device, n=5):
     fig = plt.figure(figsize=(3*n, 6))
 
     for i in range(n):
-        # ---------- ORIGINAL ----------
+        # original
         ax1 = fig.add_subplot(3, n, i+1)
         img = images[i]
 
@@ -394,36 +432,27 @@ def show_pgd_examples(model, loader, epsilon, alpha, num_iter, device, n=5):
     plt.tight_layout()
     plt.show()
 
-# =========================
 # Trace et comparatif
-# =========================
 def plot_comparison(results):
-    labels = list(results.keys())
+    plt.figure(figsize=(7,5))
 
-    clean_acc = [results[l]['clean'] for l in labels]
-    fgsm_acc = [results[l]['fgsm'] for l in labels]
-    pgd_acc  = [results[l]['pgd']  for l in labels]
+    for dataset, r in results.items():
+        accs = [r['clean'], r['fgsm'], r['pgd']]
+        plt.plot(["Clean", "FGSM", "PGD"], accs, marker='o', label=dataset)
 
-    x = range(len(labels))
-    width = 0.25
-
-    plt.figure(figsize=(9,5))
-    plt.bar(x, clean_acc, width=width, label='Clean')
-    plt.bar([i + width for i in x], fgsm_acc, width=width, label='FGSM')
-    plt.bar([i + 2*width for i in x], pgd_acc, width=width, label='PGD')
-
-    plt.xticks([i + width for i in x], labels)
     plt.ylim(0, 1)
     plt.ylabel("Accuracy")
-    plt.title("Robustesse multi-dataset")
+    plt.title("Accuracy degradation under adversarial attacks")
     plt.legend()
+    plt.grid(True)
     plt.show()
 
-# =========================
+
 # Main : traitement dataset par dataset
-# =========================
 def main():
     overall_results = {}
+    models = {}
+    loaders = {}
     for name, info in datasets_info.items():
         print(f"\n=== Dataset: {name} ===")
         dataset_cls = info["dataset"]
@@ -455,10 +484,10 @@ def main():
         print(f" Results (clean model) -> Clean Acc: {clean_acc:.4f}, Adv Acc: {adv_acc:.4f}")
 
         # Visualisation courte
-        try:
-            show_adversarial_examples(model, test_loader, epsilon, device, n=min(n_visual, len(test_dataset)))
-        except Exception as e:
-            print("  Visualisation failed:", e)
+        #try:
+        #    show_adversarial_examples(model, test_loader, epsilon, device, n=min(n_visual, len(test_dataset)))
+        #except Exception as e:
+        #   print("  Visualisation failed:", e)
 
         # --- Adversarial training (séparé) ---
         print(" Training adversarial...")
@@ -498,15 +527,15 @@ def main():
         
         noise_acc = test_model_noise(model, test_loader, sigma=0.1, device=device)
 
-        show_pgd_examples(
-            model,
-            test_loader,
-            epsilon,
-            alpha=epsilon / 10,
-            num_iter=10,
-            device=device,
-            n=n_visual
-        )
+        #show_pgd_examples(
+        #    model,
+        #    test_loader,
+        #    epsilon,
+        #    alpha=epsilon / 10,
+        #    num_iter=10,
+        #    device=device,
+        #    n=n_visual
+        #)
 
         print(
             f" Results (clean model) -> "
@@ -522,6 +551,11 @@ def main():
             f"PGD Acc: {pgd_adv_acc:.4f}"
         )
 
+        models[name] = {
+            "clean": model,
+            "adv": model_adv
+        }
+
         overall_results[name] = {
             'clean': clean_acc,
             'f1': clean_f1,
@@ -532,6 +566,13 @@ def main():
             'adv_fgsm': adv_adv_acc,
             'adv_pgd': pgd_adv_acc
         }
+
+        loaders[name] = {
+            'train': train_loader, 
+            'test': test_loader
+            }
+    return models, overall_results, loaders
+
 
     # Comparatif global
     print("\n=== Comparatif global ===")
