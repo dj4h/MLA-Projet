@@ -1,0 +1,290 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader
+from sklearn.cluster import KMeans
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+
+# Configuration
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BATCH_SIZE = 64
+EPSILON = 0.25  # Même force que pour les tests précédents
+
+# ============================================================================
+# 1. DÉFINITION DU RÉSEAU RBF (Non-Linéaire)
+# ============================================================================
+class RBF_Layer(nn.Module):
+    def __init__(self, in_features, num_centers):
+        super(RBF_Layer, self).__init__()
+        self.in_features = in_features
+        self.num_centers = num_centers
+        
+        # Les "Centres" (prototypes) et "Sigmas" (largeur de la cloche)
+        self.centers = nn.Parameter(torch.Tensor(num_centers, in_features))
+        self.sigmas = nn.Parameter(torch.Tensor(num_centers))
+        
+        # Initialisation aléatoire avant K-Means
+        nn.init.normal_(self.centers, 1)
+        nn.init.constant_(self.sigmas,1 )
+
+    def forward(self, x):
+        # Calcul de la distance Euclidienne ||x - c||
+        # x: (batch, features), centers: (centers, features)
+        x = x.unsqueeze(1) # (batch, 1, features)
+        c = self.centers.unsqueeze(0) # (1, centers, features)
+        
+        # Distance au carré
+        dist_sq = ((x - c) ** 2).sum(dim=2)
+        
+        # Fonction Gaussienne : exp(-dist^2 / 2*sigma^2)
+        # C'est purement non-linéaire (en forme de cloche)
+        return torch.exp(-dist_sq / (2 * self.sigmas.pow(2) + 1e-8))
+
+class RBFNet(nn.Module):
+    def __init__(self, num_centers=100):
+        super(RBFNet, self).__init__()
+        self.rbf = RBF_Layer(784, num_centers)
+        self.linear = nn.Linear(num_centers, 10) # Couche de sortie simple
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        x = self.rbf(x)
+        return self.linear(x)
+
+# ============================================================================
+# 2. PRÉPARATION & ENTRAÎNEMENT
+# ============================================================================
+transform = transforms.ToTensor()
+trainset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
+testset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+
+trainloader = DataLoader(trainset, batch_size=BATCH_SIZE, shuffle=True)
+testloader = DataLoader(testset, batch_size=BATCH_SIZE, shuffle=False)
+
+# --- Initialisation Intelligente (K-Means) ---
+# Les RBF apprennent mal si les centres sont aléatoires. On utilise K-Means sur une partie des données.
+print("Initialisation des centres RBF via K-Means (peut prendre quelques secondes)...")
+data_sample = next(iter(DataLoader(trainset, batch_size=5000, shuffle=True)))[0].view(5000, -1).numpy()
+kmeans = KMeans(n_clusters=100, n_init=10).fit(data_sample)
+
+model_rbf = RBFNet(num_centers=100).to(DEVICE)
+# On copie les centres trouvés par K-Means dans le modèle
+model_rbf.rbf.centers.data = torch.tensor(kmeans.cluster_centers_, dtype=torch.float32).to(DEVICE)
+# On fixe un sigma initial raisonnable
+model_rbf.rbf.sigmas.data.fill_(1.5)
+
+optimizer = optim.Adam(model_rbf.parameters(), lr=0.005)
+criterion = nn.CrossEntropyLoss()
+
+print("Entraînement du RBF...")
+model_rbf.train()
+for epoch in range(5):
+    for x, y in trainloader:
+        x, y = x.to(DEVICE), y.to(DEVICE)
+        optimizer.zero_grad()
+        output = model_rbf(x)
+        loss = criterion(output, y)
+        loss.backward()
+        optimizer.step()
+print("Terminé.")
+
+# ÉVALUATION SUR LE DATASET DE TEST MNIST (CLEAN)
+# ============================================================================
+model_rbf.eval()
+
+correct_test = 0
+total_test = 0
+
+with torch.no_grad():
+    for x, y in testloader:
+        x, y = x.to(DEVICE), y.to(DEVICE)
+        outputs = model_rbf(x)
+        preds = outputs.argmax(dim=1)
+        correct_test += (preds == y).sum().item()
+        total_test += y.size(0)
+
+accuracy_test = correct_test / total_test
+
+print(f"\nAccuracy sur le dataset de test MNIST (clean) : {accuracy_test*100:.2f}%")
+
+
+# ============================================================================
+# 3. TESTS DE RÉSISTANCE (FGSM & RUBBISH)
+# ============================================================================
+def fgsm_attack(model, images, labels, eps):
+    images.requires_grad = True
+    outputs = model(images)
+    loss = criterion(outputs, labels)
+    model.zero_grad()
+    loss.backward()
+    return torch.clamp(images + eps * images.grad.sign(), 0, 1)
+
+# Clean
+out_clean = model_rbf(batch_x)
+correct_clean = (out_clean.argmax(1) == batch_y).sum().item()
+
+# Attaque FGSM
+adv_x = fgsm_attack(model_rbf, batch_x, batch_y, EPSILON)
+out_adv = model_rbf(adv_x)
+correct_adv = (out_adv.argmax(1) == batch_y).sum().item()
+
+
+
+# ============================================================================
+# ÉVALUATION SUR LE DATASET DE TRAIN MNIST AVEC ATTAQUE FGSM
+# ============================================================================
+model_rbf.eval()
+
+correct_train_fgsm = 0
+total_train_fgsm = 0
+
+for x, y in trainloader:
+    x, y = x.to(DEVICE), y.to(DEVICE)
+
+    # Génération des exemples adversariaux FGSM
+    x_adv = fgsm_attack(model_rbf, x, y, EPSILON)
+
+    with torch.no_grad():
+        outputs = model_rbf(x_adv)
+        preds = outputs.argmax(dim=1)
+
+    correct_train_fgsm += (preds == y).sum().item()
+    total_train_fgsm += y.size(0)
+
+accuracy_train_fgsm = correct_train_fgsm / total_train_fgsm
+
+print(f"\nAccuracy sur le dataset de train MNIST avec FGSM : {accuracy_train_fgsm*100:.2f}%")
+
+# ============================================================================
+# ÉVALUATION SUR LE DATASET DE TEST MNIST AVEC ATTAQUE FGSM
+# ============================================================================
+model_rbf.eval()
+
+correct_test_fgsm = 0
+total_test_fgsm = 0
+
+for x, y in testloader:
+    x, y = x.to(DEVICE), y.to(DEVICE)
+
+    # Génération des exemples adversariaux FGSM
+    x_adv = fgsm_attack(model_rbf, x, y, EPSILON)
+
+    with torch.no_grad():
+        outputs = model_rbf(x_adv)
+        preds = outputs.argmax(dim=1)
+
+    correct_test_fgsm += (preds == y).sum().item()
+    total_test_fgsm += y.size(0)
+
+accuracy_test_fgsm = correct_test_fgsm / total_test_fgsm
+
+print(f"\nAccuracy sur le dataset de test MNIST avec FGSM : {accuracy_test_fgsm*100:.2f}%")
+
+# ============================================================================
+# 3. TESTS DE RÉSISTANCE (RUBBISH CLASS - VERSION ARTICLE)
+# ============================================================================
+
+print(f"\n--- 2. Test Rubbish Class (Version Article 2015) ---")
+
+# 1. Génération de "Gaussian Rubbish" (Bruit pur)
+# L'article mentionne que les modèles linéaires sont trompés par du bruit gaussien
+rubbish_gaussian = torch.randn(1000, 1, 28, 28).to(DEVICE)
+rubbish_gaussian = torch.clamp(rubbish_gaussian, 0, 1) # On reste dans l'espace [0, 1]
+
+# 2. Génération de "Fooling Images" (Bruit + FGSM)
+# L'article explique qu'on peut forcer n'importe quelle classe à partir du bruit
+def generate_fooling_image(model, base_noise, target_class, eps=0.25):
+    temp_noise = base_noise.clone().detach().requires_grad_(True)
+    outputs = model(temp_noise)
+    
+    # On crée un faux label cible (ex: class 3)
+    target = torch.full((base_noise.size(0),), target_class, dtype=torch.long).to(DEVICE)
+    loss = nn.CrossEntropyLoss()(outputs, target)
+    
+    model.zero_grad()
+    loss.backward()
+    
+    # On pousse le bruit vers la classe cible (Gradient Sign Descent pour la perte)
+    fooling_image = temp_noise - eps * temp_noise.grad.sign()
+    return torch.clamp(fooling_image, 0, 1)
+
+# Évaluation
+model_rbf.eval()
+with torch.no_grad():
+    # Sortie sur bruit pur
+    out_rubbish = model_rbf(rubbish_gaussian)
+    # L'article suggère que les RBF ont une activation quasi-nulle loin des données
+    # Pour un RBF, la confiance est souvent mesurée par l'intensité de l'activation avant Softmax
+    probs_rubbish = torch.softmax(out_rubbish, dim=1)
+    max_conf, preds = probs_rubbish.max(1)
+    
+    # Dans l'article, un taux d'erreur de 0% sur le rubbish signifie que le modèle
+    # ne classifie PAS ces images comme appartenant aux classes 0-9 avec confiance.
+    # On définit un seuil de rejet (ex: si conf < 0.5, on considère cela comme "correctement rejeté")
+    threshold = 0.5
+    correctly_rejected = (max_conf < threshold).float().mean().item()
+
+print(f"Confiance moyenne sur bruit Gaussien : {max_conf.mean().item()*100:.2f}%")
+print(f"Taux de rejet (Confiance < {threshold}) : {correctly_rejected*100:.2f}%")
+
+# Test des images "Fooling" (Bruit dirigé vers la classe 3)
+fooling_samples = generate_fooling_image(model_rbf, rubbish_gaussian[:100], target_class=3)
+with torch.no_grad():
+    out_fooling = model_rbf(fooling_samples)
+    conf_fooling = torch.softmax(out_fooling, dim=1).max(1)[0].mean().item()
+
+print(f"Confiance moyenne sur 'Fooling Images' (bruit optimisé) : {conf_fooling*100:.2f}%")
+
+print("\nAnalyse selon l'article :")
+print("- Un modèle Linéaire/Maxout aurait une confiance > 90% ici.")
+print("- Le RBF, grâce à ses cloches de Gauss localisées, 's'éteint' dans les zones vides.")
+
+# ============================================================================
+# 4. TEST DE TRANSFERT (Softmax -> RBF)
+# ============================================================================
+print(f"\n--- 3. Test de Transfert (Linear -> RBF) ---")
+
+# 1. On entraîne rapidement un modèle linéaire (Softmax)
+model_linear = nn.Linear(28*28, 10).to(DEVICE)
+opt_lin = optim.SGD(model_linear.parameters(), lr=0.1)
+
+# Entraînement rapide sur quelques batchs pour avoir des poids cohérents
+model_linear.train()
+for epoch in range(2): # 2 époques suffisent pour l'attaque
+    for x, y in trainloader:
+        x = x.view(-1, 28*28).to(DEVICE)
+        y = y.to(DEVICE)
+        loss = nn.CrossEntropyLoss()(model_linear(x), y)
+        opt_lin.zero_grad(); loss.backward(); opt_lin.step()
+
+# 2. Génération de l'attaque SUR LE MODÈLE LINÉAIRE
+# --- CORRECTION ICI ---
+# On utilise .clone().detach() pour casser le graphe et créer une "feuille"
+batch_x_flat = batch_x.view(-1, 28*28).clone().detach().to(DEVICE)
+batch_x_flat.requires_grad = True
+
+# Passe avant sur le modèle linéaire
+output_lin = model_linear(batch_x_flat)
+loss = nn.CrossEntropyLoss()(output_lin, batch_y)
+
+# Calcul du gradient
+model_linear.zero_grad()
+loss.backward()
+
+# Création de l'image adversaire (basée sur le gradient du linéaire)
+# x_adv = x + eps * sign(grad_lineaire)
+adv_transfer = torch.clamp(batch_x_flat + EPSILON * batch_x_flat.grad.sign(), 0, 1)
+adv_transfer = adv_transfer.view(-1, 1, 28, 28) # Reshape pour rentrer dans le RBF
+
+# 3. Test de cette image SUR LE RBF
+with torch.no_grad():
+    out_transfer = model_rbf(adv_transfer)
+    acc_transfer = (out_transfer.argmax(1) == batch_y).float().mean().item()
+
+print(f"Précision du RBF sur attaques transférées du Linéaire : {acc_transfer*100:.2f}%")
+print("Analyse : Si ce score est élevé (>80%), le RBF ignore les attaques conçues pour le linéaire.")
