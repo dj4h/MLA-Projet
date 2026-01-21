@@ -4,12 +4,6 @@
 
 ## Liste des fichiers
 
-### `4-linear perturbations for non linear models`
-Description : Dossier contenant une autre implémentation des essais de vulnérabilité sur les différents modèles.
-
-### `old`
-Description : Dossier contenant un ensemble de fichiers issus des différents essais sur l'implémentation de l'article.
-
 ### 0. `0.googlenet.ipynb`
 Description : Utilisation d'un modèle GoogleNet pré-entraîné pour générer des exemples adversariaux concrets.
 ```bash
